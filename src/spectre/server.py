@@ -69,7 +69,7 @@ def _get_writer() -> Writer:
 def _get_scraper() -> Scraper:
     global _scraper
     if _scraper is None:
-        _scraper = Scraper(_get_pool(), proxy=os.environ.get("SPECTRE_PROXY"))
+        _scraper = Scraper(_get_pool(), proxy=os.environ.get("SPECTRE_PROXY"), client=_get_client())
     return _scraper
 
 
