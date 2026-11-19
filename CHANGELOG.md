@@ -3,6 +3,12 @@
 All notable changes to `spectre-mcp`. Versioning is semver; the tool surface is
 the public API.
 
+## Unreleased
+
+- **Current X web reads no longer depend on the signing bundle.** Search,
+  profiles and user timelines use Spectre's authenticated GraphQL POST transport,
+  avoiding `Signing script not found` when X serves the newer `x-web` bundle.
+
 ## 2.0.6 — 2026-11-14
 
 - **Multi-account `doctor` was wrong.** It compared every pool account to a
