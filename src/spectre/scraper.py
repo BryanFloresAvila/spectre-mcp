@@ -1,8 +1,8 @@
-"""Timeline/search reads on top of twscrape, normalised to Spectre's shapes.
+"""Timeline/search reads normalised to Spectre's shapes.
 
-twscrape is good at the awkward paginated read endpoints (search, timelines,
-follower pages) and bad at surfacing why something came back empty. This module
-wraps it so that:
+The POST-based GraphQL transport handles the current X web responses without
+requiring the browser transaction-id bundle. A twscrape fallback remains for
+the less common read endpoints. This module wraps both paths so that:
 
 * the requested `limit` is the number of items returned — twscrape happily yields
   a whole page regardless of the limit you ask for;
@@ -20,7 +20,13 @@ from typing import AsyncIterator, Optional
 from twscrape import API, AccountsPool
 
 from spectre.errors import XError
-from spectre.parse import iso_time, sid
+from spectre.parse import (
+    iso_time,
+    sid,
+    timeline as gql_timeline,
+    user_dict as gql_user_dict,
+)
+from spectre.xclient import XClient
 
 
 def _best_video(variants) -> Optional[str]:
@@ -144,23 +150,85 @@ async def _take(gen: AsyncIterator, limit: int, deadline: float) -> tuple[list, 
 
 
 class Scraper:
-    """Paginated reads through twscrape, sharing the caller's account pool."""
+    """Paginated reads sharing the caller's account pool."""
 
-    def __init__(self, pool: AccountsPool, proxy: Optional[str] = None, default_budget: float = 90.0):
+    def __init__(
+        self,
+        pool: AccountsPool,
+        proxy: Optional[str] = None,
+        default_budget: float = 90.0,
+        client: Optional[XClient] = None,
+    ):
         self._pool = pool
         self.proxy = proxy
         self.default_budget = default_budget
         self._api: Optional[API] = None
+        self._xclient = client
+        self._owns_xclient = client is None
 
     async def api(self) -> API:
         if self._api is None:
             self._api = API(self._pool, proxy=self.proxy)
         return self._api
 
+    async def xclient(self) -> XClient:
+        """Return the POST-based GraphQL transport used by current X pages.
+
+        twscrape's paginated GET path still requires a browser transaction-id.
+        X currently serves the same read operations over POST without that
+        header, so the reads that power the MCP search/profile tools use the
+        shared Spectre transport instead.
+        """
+        if self._xclient is None:
+            self._xclient = XClient(self._pool, proxy=self.proxy)
+        return self._xclient
+
     async def close(self) -> None:
         # twscrape's AccountsPool has no close(); drop the reference so the
         # connection is garbage collected with the pool the server owns.
         self._api = None
+        if self._owns_xclient and self._xclient is not None:
+            await self._xclient.aclose()
+            self._xclient = None
+
+    async def _gql_timeline(self, operation: str, variables: dict, limit: int) -> tuple[list[dict], list[dict], bool]:
+        """Read timeline pages over POST, without requiring x-client-transaction-id."""
+        client = await self.xclient()
+        tweets: list[dict] = []
+        users: list[dict] = []
+        seen_tweets: set[str] = set()
+        seen_users: set[str] = set()
+        cursor: Optional[str] = None
+        deadline = time.monotonic() + self.default_budget
+
+        while len(tweets) + len(users) < limit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return tweets[:limit], users[:limit], True
+
+            page_vars = dict(variables)
+            page_vars["count"] = max(20, min(100, limit - len(tweets) - len(users)))
+            if cursor:
+                page_vars["cursor"] = cursor
+            data = await asyncio.wait_for(client.graphql(operation, page_vars), timeout=remaining)
+            page_tweets, page_users, next_cursor = gql_timeline(data)
+
+            for tweet in page_tweets:
+                tweet_id = tweet.get("id")
+                if tweet_id and tweet_id not in seen_tweets:
+                    seen_tweets.add(tweet_id)
+                    tweets.append(tweet)
+            for user in page_users:
+                user_id = user.get("id")
+                if user_id and user_id not in seen_users:
+                    seen_users.add(user_id)
+                    users.append(user)
+
+            if not next_cursor or next_cursor == cursor or (not page_tweets and not page_users):
+                return tweets[:limit], users[:limit], False
+            cursor = next_cursor
+
+        return tweets[:limit], users[:limit], False
 
 
     async def _ensure_available(self, queue: str) -> None:
@@ -205,58 +273,66 @@ class Scraper:
             raise XError(f"User @{username} not found.", kind="not_found", code=50)
         return user
 
+    async def _gql_user(self, username: str) -> dict:
+        client = await self.xclient()
+        data = await client.graphql(
+            "UserByScreenName",
+            {"screen_name": username.lstrip("@"), "withSafetyModeUserFields": True},
+        )
+        user = gql_user_dict((data.get("data") or {}).get("user", {}).get("result"))
+        if not user:
+            raise XError(f"User @{username} not found.", kind="not_found", code=50)
+        return user
+
     async def user(self, username: str) -> dict:
-        await self._ensure_available("UserByScreenName")
-        return user_dict(await self._user(username))
+        return await self._gql_user(username)
 
     async def user_by_id(self, user_id: str) -> dict:
-        await self._ensure_available("UserByRestId")
-        api = await self.api()
-        user = await api.user_by_id(str(user_id))
+        client = await self.xclient()
+        data = await client.graphql(
+            "UserByRestId",
+            {"userId": str(user_id), "withSafetyModeUserFields": True},
+        )
+        user = gql_user_dict((data.get("data") or {}).get("user", {}).get("result"))
         if not user:
             raise XError(f"No user with id {user_id}.", kind="not_found", code=50)
-        return user_dict(user)
+        return user
 
     # ── search ──
 
     async def search(self, query: str, limit: int = 20, mode: str = "latest") -> list[dict]:
-        await self._ensure_available("SearchTimeline")
-        api = await self.api()
-        product = {"latest": "Latest", "top": "Top", "media": "Media"}.get(mode.lower())
+        mode_key = mode.lower()
+        product = {"latest": "Latest", "top": "Top", "media": "Media"}.get(mode_key)
         if not product:
             raise XError('mode must be "latest", "top" or "media".', kind="validation")
-        kv = {"product": product}
-        if mode == "media":
+        kv = {"rawQuery": query, "product": product, "querySource": "typed_query"}
+        if mode_key == "media":
             kv["with_tweet_replies"] = False
-        deadline = time.monotonic() + self.default_budget
-        tweets, truncated = await _take(api.search(query, limit=limit, kv=kv), limit, deadline)
-        if truncated and not tweets:
-            raise XError(
-                "No response from X before the time budget ran out.",
-                kind="rate_limit",
-                hint="The account is probably locked or rate limited — check pool_status / get_rate_limits.",
-            )
-        return [tweet_dict(t) for t in tweets]
+        tweets, _, _ = await self._gql_timeline("SearchTimeline", kv, limit)
+        return tweets
 
     async def search_users(self, query: str, limit: int = 10) -> list[dict]:
-        await self._ensure_available("SearchTimeline")
-        api = await self.api()
-        deadline = time.monotonic() + self.default_budget
-        users, _ = await _take(api.search_user(query, limit=limit), limit, deadline)
-        return [user_dict(u) for u in users]
+        _, users, _ = await self._gql_timeline(
+            "SearchTimeline",
+            {"rawQuery": query, "product": "People", "querySource": "typed_query"},
+            limit,
+        )
+        return users
 
     # ── timelines ──
 
     async def user_tweets(self, username: str, limit: int = 20, replies: bool = False, media_only: bool = False) -> dict:
-        await self._ensure_available("UserMedia" if media_only else ("UserTweetsAndReplies" if replies else "UserTweets"))
-        api = await self.api()
-        user = await self._user(username)
-        gen = api.user_media(user.id, limit=limit) if media_only else (
-            api.user_tweets_and_replies(user.id, limit=limit) if replies else api.user_tweets(user.id, limit=limit)
-        )
-        deadline = time.monotonic() + self.default_budget
-        tweets, truncated = await _take(gen, limit, deadline)
-        return {"tweets": [tweet_dict(t) for t in tweets], "count": len(tweets), "truncated": truncated}
+        user = await self._gql_user(username)
+        operation = "UserMedia" if media_only else ("UserTweetsAndReplies" if replies else "UserTweets")
+        variables = {
+            "userId": user["id"],
+            "includePromotedContent": True,
+            "withQuickPromoteEligibilityTweetFields": True,
+            "withVoice": True,
+            "withV2Timeline": True,
+        }
+        tweets, _, truncated = await self._gql_timeline(operation, variables, limit)
+        return {"tweets": tweets, "count": len(tweets), "truncated": truncated}
 
     async def followers(self, username: str, limit: int = 20) -> dict:
         return await self._connections(username, limit, followers=True)
